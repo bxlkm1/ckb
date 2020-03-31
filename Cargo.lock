@@ -1008,6 +1008,7 @@ dependencies = [
  "ckb-types",
  "ckb-util",
  "ckb-verification",
+ "crossbeam-channel",
  "crossbeam-deque",
  "failure",
  "faketime",

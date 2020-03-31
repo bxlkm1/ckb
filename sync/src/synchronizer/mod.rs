@@ -20,14 +20,16 @@ use crate::{
 };
 use ckb_chain::chain::ChainController;
 use ckb_logger::{debug, error, info, metric, trace, warn};
-use ckb_network::{bytes::Bytes, CKBProtocolContext, CKBProtocolHandler, PeerIndex};
+use ckb_network::{
+    bytes::Bytes, CKBProtocolContext, CKBProtocolHandler, PeerIndex, ServiceControl,
+};
 use ckb_types::{core, packed, prelude::*};
 use crossbeam_deque::{Injector, Worker};
 use failure::Error as FailureError;
 use faketime::unix_time_as_millis;
 use std::cmp::min;
 use std::iter;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -48,11 +50,65 @@ type BlockQueue = Injector<(
     Arc<dyn CKBProtocolContext + Sync>,
 )>;
 
+enum FetchCMD {
+    Fetch(Vec<PeerIndex>),
+    Shutdown,
+}
+
+struct BlockFetchCMD {
+    can_fetch_block: Arc<AtomicBool>,
+    sync: Synchronizer,
+    p2p_control: ServiceControl,
+    recv: crossbeam_channel::Receiver<FetchCMD>,
+}
+
+impl BlockFetchCMD {
+    fn run(&self) {
+        while let Ok(cmd) = self.recv.recv() {
+            match cmd {
+                FetchCMD::Fetch(peers) => {
+                    self.can_fetch_block.store(false, Ordering::Release);
+                    for peer in peers {
+                        if let Some(fetch) =
+                            BlockFetcher::new(&self.sync, peer, IBDState::In).fetch()
+                        {
+                            for item in fetch {
+                                BlockFetchCMD::send_getblocks(item, &self.p2p_control, peer);
+                            }
+                        }
+                    }
+                    self.can_fetch_block.store(true, Ordering::Release)
+                }
+                FetchCMD::Shutdown => break,
+            }
+        }
+    }
+
+    fn send_getblocks(v_fetch: Vec<packed::Byte32>, nc: &ServiceControl, peer: PeerIndex) {
+        let content = packed::GetBlocks::new_builder()
+            .block_hashes(v_fetch.clone().pack())
+            .build();
+        let message = packed::SyncMessage::new_builder().set(content).build();
+
+        debug!("send_getblocks len={:?} to peer={}", v_fetch.len(), peer);
+        if let Err(err) = nc.send_message_to(
+            peer,
+            crate::NetworkProtocol::SYNC.into(),
+            message.as_bytes(),
+        ) {
+            debug!("synchronizer send GetBlocks error: {:?}", err);
+        }
+        crate::synchronizer::log_sent_metric(message.to_enum().item_name());
+    }
+}
+
 #[derive(Clone)]
 pub struct Synchronizer {
     pub chain: ChainController,
     pub shared: Arc<SyncShared>,
     pub block_queue: Arc<BlockQueue>,
+    can_fetch_block: Arc<AtomicBool>,
+    fetch_channel: Option<crossbeam_channel::Sender<FetchCMD>>,
 }
 
 impl Synchronizer {
@@ -61,6 +117,8 @@ impl Synchronizer {
             chain,
             shared,
             block_queue: Arc::new(Injector::new()),
+            can_fetch_block: Arc::new(AtomicBool::new(true)),
+            fetch_channel: None,
         };
         synchronizer.spawn_process_block();
         synchronizer
@@ -96,11 +154,11 @@ impl Synchronizer {
                 let task = worker.pop().or_else(|| {
                     // Otherwise, we need to look for a task elsewhere.
                     iter::repeat_with(|| {
-                                // Try stealing a batch of tasks from the global queue.
-                                synchronizer.block_queue.steal_batch_and_pop(&worker)
-                                    // Or try stealing a task from one of the other threads.
-                                    .or_else(|| stealers.iter().map(|s| s.steal()).collect())
-                        })
+                        // Try stealing a batch of tasks from the global queue.
+                        synchronizer.block_queue.steal_batch_and_pop(&worker)
+                            // Or try stealing a task from one of the other threads.
+                            .or_else(|| stealers.iter().map(|s| s.steal()).collect())
+                    })
                         // Loop while no task was stolen and any steal operation needs to be retried.
                         .find(|s| !s.is_retry())
                         // Extract the stolen task, if there is one.
@@ -115,7 +173,7 @@ impl Synchronizer {
                             .state()
                             .insert_block_status(block_hash.clone(), BlockStatus::BLOCK_INVALID);
                         let status = StatusCode::BlockIsInvalid
-                            .with_context(format!("{}, error: {}", block_hash, err,));
+                            .with_context(format!("{}, error: {}", block_hash, err, ));
                         if let Some(ban_time) = status.should_ban() {
                             error!(
                                 "receive block {} from {}, ban {:?} for {}",
@@ -268,8 +326,8 @@ impl Synchronizer {
         &self,
         peer: PeerIndex,
         ibd: IBDState,
-    ) -> Option<Vec<packed::Byte32>> {
-        BlockFetcher::new(self.clone(), peer, ibd).fetch()
+    ) -> Option<Vec<Vec<packed::Byte32>>> {
+        BlockFetcher::new(&self, peer, ibd).fetch()
     }
 
     fn on_connected(&self, nc: &dyn CKBProtocolContext, peer: PeerIndex) {
@@ -462,33 +520,111 @@ impl Synchronizer {
         }
     }
 
-    fn find_blocks_to_fetch(&self, nc: &dyn CKBProtocolContext, ibd: IBDState) {
+    fn find_blocks_to_fetch(&mut self, nc: &dyn CKBProtocolContext, ibd: IBDState) {
+        let tip = self.shared.active_chain().tip_number();
+
+        let disconnect_list = {
+            let mut list = self.shared().state().write_inflight_blocks().prune(tip);
+            if let IBDState::In = ibd {
+                // best known < tip and in IBD state, these node can be disconnect
+                list.extend(
+                    self.shared
+                        .state()
+                        .peers()
+                        .get_best_known_less_than_tip(tip),
+                )
+            };
+            list
+        };
+
+        for peer in disconnect_list.iter() {
+            if self
+                .peers()
+                .get_flag(*peer)
+                .map(|flag| flag.is_whitelist || flag.is_protect)
+                .unwrap_or(false)
+            {
+                continue;
+            }
+            if let Err(err) = nc.disconnect(*peer, "sync disconnect") {
+                debug!("synchronizer disconnect error: {:?}", err);
+            }
+        }
+
+        if !self.can_fetch_block.load(Ordering::Acquire) {
+            return;
+        }
+
         let peers: Vec<PeerIndex> = {
-            self.peers()
+            let state = &self
+                .shared
+                .state()
+                .read_inflight_blocks()
+                .download_schedulers;
+            let mut peers: Vec<PeerIndex> = self
+                .peers()
                 .state
                 .read()
                 .iter()
-                .filter(|(_, state)| match ibd {
-                    IBDState::In => {
-                        state.peer_flags.is_outbound
-                            || state.peer_flags.is_whitelist
-                            || state.peer_flags.is_protect
+                .filter(|(id, state)| {
+                    if disconnect_list.contains(id) {
+                        return false;
+                    };
+                    match ibd {
+                        IBDState::In => {
+                            state.peer_flags.is_outbound
+                                || state.peer_flags.is_whitelist
+                                || state.peer_flags.is_protect
+                        }
+                        IBDState::Out => state.sync_started,
                     }
-                    IBDState::Out => state.sync_started,
                 })
                 .map(|(peer_id, _)| peer_id)
                 .cloned()
-                .collect()
+                .collect();
+            peers.sort_by_key(|id| {
+                state
+                    .get(id)
+                    .map(|d| d.task_count())
+                    .unwrap_or(crate::MAX_BLOCKS_IN_TRANSIT_PER_PEER)
+            });
+            peers
         };
 
         trace!("poll find_blocks_to_fetch select peers");
-        {
-            self.shared().state().write_inflight_blocks().prune();
-        }
-        for peer in peers {
-            if let Some(fetch) = self.get_blocks_to_fetch(peer, ibd) {
-                if !fetch.is_empty() {
-                    self.send_getblocks(fetch, nc, peer);
+        // fetch use a lot of cpu time, especially in ibd state
+        match nc.p2p_control() {
+            Some(raw) if ibd.into() => match self.fetch_channel {
+                Some(ref send) => send.send(FetchCMD::Fetch(peers)).unwrap(),
+                None => {
+                    let p2p_control = raw.clone();
+                    let sync = self.clone();
+                    let can_fetch_block = Arc::clone(&self.can_fetch_block);
+                    let (sender, recv) = crossbeam_channel::bounded(2);
+                    sender.send(FetchCMD::Fetch(peers)).unwrap();
+                    self.fetch_channel = Some(sender);
+                    ::std::thread::spawn(move || {
+                        BlockFetchCMD {
+                            sync,
+                            p2p_control,
+                            recv,
+                            can_fetch_block,
+                        }
+                        .run();
+                    });
+                }
+            },
+            _ => {
+                if let Some(sender) = self.fetch_channel.take() {
+                    sender.send(FetchCMD::Shutdown).unwrap();
+                }
+
+                for peer in peers {
+                    if let Some(fetch) = self.get_blocks_to_fetch(peer, ibd) {
+                        for item in fetch {
+                            self.send_getblocks(item, nc, peer);
+                        }
+                    }
                 }
             }
         }
@@ -1254,16 +1390,16 @@ mod tests {
             .unwrap();
 
         assert_eq!(
-            blocks_to_fetch.first().unwrap(),
+            blocks_to_fetch[0].first().unwrap(),
             &shared2.store().get_block_hash(193).unwrap()
         );
         assert_eq!(
-            blocks_to_fetch.last().unwrap(),
+            blocks_to_fetch[0].last().unwrap(),
             &shared2.store().get_block_hash(200).unwrap()
         );
 
         let mut fetched_blocks = Vec::new();
-        for block_hash in &blocks_to_fetch {
+        for block_hash in &blocks_to_fetch[0] {
             fetched_blocks.push(shared2.store().get_block(block_hash).unwrap());
         }
 
@@ -1281,7 +1417,7 @@ mod tests {
                 .get_last_common_header(peer1)
                 .unwrap()
                 .hash(),
-            blocks_to_fetch.last().unwrap()
+            blocks_to_fetch[0].last().unwrap()
         );
     }
 
