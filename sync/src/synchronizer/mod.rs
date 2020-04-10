@@ -22,11 +22,14 @@ use ckb_chain::chain::ChainController;
 use ckb_logger::{debug, error, info, metric, trace, warn};
 use ckb_network::{bytes::Bytes, CKBProtocolContext, CKBProtocolHandler, PeerIndex};
 use ckb_types::{core, packed, prelude::*};
+use crossbeam_deque::{Injector, Worker};
 use failure::Error as FailureError;
 use faketime::unix_time_as_millis;
 use std::cmp::min;
+use std::iter;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::thread;
 use std::time::{Duration, Instant};
 
 pub const SEND_GET_HEADERS_TOKEN: u64 = 0;
@@ -39,15 +42,116 @@ const SYNC_NOTIFY_INTERVAL: Duration = Duration::from_millis(200);
 const IBD_BLOCK_FETCH_INTERVAL: Duration = Duration::from_millis(40);
 const NOT_IBD_BLOCK_FETCH_INTERVAL: Duration = Duration::from_millis(200);
 
+type BlockQueue = Injector<(
+    PeerIndex,
+    Arc<core::BlockView>,
+    Arc<dyn CKBProtocolContext + Sync>,
+)>;
+
 #[derive(Clone)]
 pub struct Synchronizer {
-    chain: ChainController,
+    pub chain: ChainController,
     pub shared: Arc<SyncShared>,
+    pub block_queue: Arc<BlockQueue>,
 }
 
 impl Synchronizer {
     pub fn new(chain: ChainController, shared: Arc<SyncShared>) -> Synchronizer {
-        Synchronizer { chain, shared }
+        let synchronizer = Synchronizer {
+            chain,
+            shared,
+            block_queue: Arc::new(Injector::new()),
+        };
+        synchronizer.spawn_process_block();
+        synchronizer
+    }
+
+    pub fn receive_block(
+        &self,
+        peer: PeerIndex,
+        block: Arc<core::BlockView>,
+        nc: Arc<dyn CKBProtocolContext + Sync>,
+    ) {
+        self.block_queue.push((peer, block, nc));
+    }
+
+    pub fn spawn_process_block(&self) {
+        let num = 2;
+        let workers: Vec<_> = (0..num).map(|_| Worker::new_fifo()).collect();
+
+        let stealers: Vec<_> = (0..num)
+            .map(|index| {
+                workers
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, w)| if i == index { None } else { Some(w.stealer()) })
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        let workers: Vec<_> = workers.into_iter().zip(stealers.into_iter()).collect();
+        for (worker, stealers) in workers {
+            let synchronizer = self.clone();
+            let _thread = thread::Builder::new().spawn(move || loop {
+                // Pop a task from the local queue, if not empty.
+                let task = worker.pop().or_else(|| {
+                    // Otherwise, we need to look for a task elsewhere.
+                    iter::repeat_with(|| {
+                                // Try stealing a batch of tasks from the global queue.
+                                synchronizer.block_queue.steal_batch_and_pop(&worker)
+                                    // Or try stealing a task from one of the other threads.
+                                    .or_else(|| stealers.iter().map(|s| s.steal()).collect())
+                        })
+                        // Loop while no task was stolen and any steal operation needs to be retried.
+                        .find(|s| !s.is_retry())
+                        // Extract the stolen task, if there is one.
+                        .and_then(|s| s.success())
+                });
+
+                if let Some((peer, block, nc)) = task {
+                    let block_hash = block.hash();
+                    if let Err(err) = synchronizer.process_new_block(peer, block) {
+                        synchronizer
+                            .shared
+                            .state()
+                            .insert_block_status(block_hash.clone(), BlockStatus::BLOCK_INVALID);
+                        let status = StatusCode::BlockIsInvalid
+                            .with_context(format!("{}, error: {}", block_hash, err,));
+                        if let Some(ban_time) = status.should_ban() {
+                            error!(
+                                "receive block {} from {}, ban {:?} for {}",
+                                block_hash, peer, ban_time, status
+                            );
+                            nc.ban_peer(peer, ban_time, status.to_string());
+                        }
+                    }
+                } else {
+                    let active_chain = synchronizer.shared.active_chain();
+                    let tip_hash = active_chain.tip_hash();
+                    let descendants = synchronizer
+                        .shared
+                        .state()
+                        .remove_orphan_by_parent(&tip_hash);
+                    if !descendants.is_empty() {
+                        for (peer, block) in descendants {
+                            // If we can not find the block's parent in database, that means it was failed to accept
+                            // its parent, so we treat it as an invalid block as well.
+                            if !synchronizer.shared.is_parent_stored(&block) {
+                                continue;
+                            }
+
+                            let block = Arc::new(block);
+                            let _ = synchronizer.shared.accept_block(
+                                &synchronizer.chain,
+                                peer,
+                                Arc::clone(&block),
+                            );
+                        }
+                    } else {
+                        thread::yield_now();
+                    }
+                }
+            });
+        }
     }
 
     pub fn shared(&self) -> &Arc<SyncShared> {
@@ -56,40 +160,42 @@ impl Synchronizer {
 
     fn try_process<'r>(
         &self,
-        nc: &dyn CKBProtocolContext,
+        nc: Arc<dyn CKBProtocolContext + Sync>,
         peer: PeerIndex,
         message: packed::SyncMessageUnionReader<'r>,
     ) -> Status {
         match message {
             packed::SyncMessageUnionReader::GetHeaders(reader) => {
-                GetHeadersProcess::new(reader, self, peer, nc).execute()
+                GetHeadersProcess::new(reader, self, peer, nc.as_ref()).execute()
             }
             packed::SyncMessageUnionReader::SendHeaders(reader) => {
-                HeadersProcess::new(reader, self, peer, nc).execute()
+                HeadersProcess::new(reader, self, peer, nc.as_ref()).execute()
             }
             packed::SyncMessageUnionReader::GetBlocks(reader) => {
-                GetBlocksProcess::new(reader, self, peer, nc).execute()
+                GetBlocksProcess::new(reader, self, peer, nc.as_ref()).execute()
             }
             packed::SyncMessageUnionReader::SendBlock(reader) => {
                 if reader.check_data() {
-                    BlockProcess::new(reader, self, peer).execute()
+                    BlockProcess::new(reader, self, peer, nc).execute()
                 } else {
                     StatusCode::ProtocolMessageIsMalformed.with_context("SendBlock is invalid")
                 }
             }
-            packed::SyncMessageUnionReader::InIBD(_) => InIBDProcess::new(self, peer, nc).execute(),
+            packed::SyncMessageUnionReader::InIBD(_) => {
+                InIBDProcess::new(self, peer, nc.as_ref()).execute()
+            }
             _ => StatusCode::ProtocolMessageIsMalformed.with_context("unexpected sync message"),
         }
     }
 
     fn process<'r>(
         &self,
-        nc: &dyn CKBProtocolContext,
+        nc: Arc<dyn CKBProtocolContext + Sync>,
         peer: PeerIndex,
         message: packed::SyncMessageUnionReader<'r>,
     ) {
         let item_name = message.item_name();
-        let status = self.try_process(nc, peer, message);
+        let status = self.try_process(Arc::clone(&nc), peer, message);
 
         metric!({
             "topic": "received",
@@ -132,7 +238,7 @@ impl Synchronizer {
     pub fn process_new_block(
         &self,
         peer: PeerIndex,
-        block: core::BlockView,
+        block: Arc<core::BlockView>,
     ) -> Result<bool, FailureError> {
         let block_hash = block.hash();
         let status = self.shared.active_chain().get_block_status(&block_hash);
@@ -147,8 +253,7 @@ impl Synchronizer {
                 .set_last_common_header(peer, block.header());
             Ok(false)
         } else if status.contains(BlockStatus::HEADER_VALID) {
-            self.shared
-                .insert_new_block(&self.chain, peer, Arc::new(block))
+            self.shared.insert_new_block(&self.chain, peer, block)
         } else {
             debug!(
                 "Synchronizer process_new_block unexpected status {:?} {}",
@@ -451,7 +556,7 @@ impl CKBProtocolHandler for Synchronizer {
         });
 
         let start_time = Instant::now();
-        self.process(nc.as_ref(), peer_index, msg.as_reader());
+        self.process(nc, peer_index, msg.as_reader());
         debug!(
             "process message={}, peer={}, cost={:?}",
             msg.item_name(),

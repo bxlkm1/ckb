@@ -1,15 +1,17 @@
 use crate::{
     synchronizer::{BlockStatus, Synchronizer},
-    Status, StatusCode,
+    Status,
 };
 use ckb_logger::debug;
-use ckb_network::PeerIndex;
+use ckb_network::{CKBProtocolContext, PeerIndex};
 use ckb_types::{packed, prelude::*};
+use std::sync::Arc;
 
 pub struct BlockProcess<'a> {
     message: packed::SendBlockReader<'a>,
     synchronizer: &'a Synchronizer,
     peer: PeerIndex,
+    nc: Arc<dyn CKBProtocolContext + Sync>,
 }
 
 impl<'a> BlockProcess<'a> {
@@ -17,16 +19,18 @@ impl<'a> BlockProcess<'a> {
         message: packed::SendBlockReader<'a>,
         synchronizer: &'a Synchronizer,
         peer: PeerIndex,
+        nc: Arc<dyn CKBProtocolContext + Sync>,
     ) -> Self {
         BlockProcess {
             message,
             synchronizer,
             peer,
+            nc,
         }
     }
 
     pub fn execute(self) -> Status {
-        let block = self.message.block().to_entity().into_view();
+        let block = Arc::new(self.message.block().to_entity().into_view());
         debug!(
             "BlockProcess received block {} {}",
             block.number(),
@@ -36,17 +40,8 @@ impl<'a> BlockProcess<'a> {
         let state = shared.state();
 
         if state.new_block_received(&block) {
-            if let Err(err) = self
-                .synchronizer
-                .process_new_block(self.peer, block.clone())
-            {
-                state.insert_block_status(block.hash(), BlockStatus::BLOCK_INVALID);
-                return StatusCode::BlockIsInvalid.with_context(format!(
-                    "{}, error: {}",
-                    block.hash(),
-                    err,
-                ));
-            }
+            self.synchronizer
+                .receive_block(self.peer, block.clone(), Arc::clone(&self.nc));
         } else if shared
             .active_chain()
             .contains_block_status(&block.hash(), BlockStatus::BLOCK_STORED)
