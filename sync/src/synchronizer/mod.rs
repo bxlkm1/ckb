@@ -29,7 +29,7 @@ use failure::Error as FailureError;
 use faketime::unix_time_as_millis;
 use std::cmp::min;
 use std::iter;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -43,6 +43,20 @@ pub const NO_PEER_CHECK_TOKEN: u64 = 255;
 const SYNC_NOTIFY_INTERVAL: Duration = Duration::from_millis(200);
 const IBD_BLOCK_FETCH_INTERVAL: Duration = Duration::from_millis(40);
 const NOT_IBD_BLOCK_FETCH_INTERVAL: Duration = Duration::from_millis(200);
+
+pub static ORPHAN_COUNT: AtomicUsize = AtomicUsize::new(0);
+pub static PUNISH_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+async fn show_metric() {
+    loop {
+        tokio::time::delay_for(Duration::from_millis(1000 * 20)).await;
+        info!(
+            "orphan count: {}, punish count: {}",
+            ORPHAN_COUNT.load(Ordering::Acquire),
+            PUNISH_COUNT.load(Ordering::Acquire)
+        )
+    }
+}
 
 type BlockQueue = Injector<(
     PeerIndex,
@@ -173,7 +187,7 @@ impl Synchronizer {
                             .state()
                             .insert_block_status(block_hash.clone(), BlockStatus::BLOCK_INVALID);
                         let status = StatusCode::BlockIsInvalid
-                            .with_context(format!("{}, error: {}", block_hash, err, ));
+                            .with_context(format!("{}, error: {}", block_hash, err,));
                         if let Some(ban_time) = status.should_ban() {
                             error!(
                                 "receive block {} from {}, ban {:?} for {}",
@@ -597,6 +611,7 @@ impl Synchronizer {
             Some(raw) if ibd.into() => match self.fetch_channel {
                 Some(ref send) => send.send(FetchCMD::Fetch(peers)).unwrap(),
                 None => {
+                    tokio::spawn(async {show_metric().await});
                     let p2p_control = raw.clone();
                     let sync = self.clone();
                     let can_fetch_block = Arc::clone(&self.can_fetch_block);

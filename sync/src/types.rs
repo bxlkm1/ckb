@@ -477,6 +477,7 @@ impl InflightBlocks {
                         for hash in hashes {
                             let state = states.remove(&hash).unwrap();
                             if let Some(d) = blocks.get_mut(&state.peer) {
+                                crate::synchronizer::PUNISH_COUNT.fetch_add(1, Ordering::Release);
                                 d.punish();
                                 d.hashes.remove(&hash);
                             };
@@ -913,6 +914,7 @@ impl SyncShared {
                 block.header().number(),
                 block.header().hash()
             );
+            crate::synchronizer::ORPHAN_COUNT.fetch_add(1, Ordering::Release);
             self.state.insert_orphan_block(pi, (*block).clone());
             let tip = self.shared.snapshot().tip_number();
             if let Some(entry) = self

@@ -26,6 +26,7 @@ ckb-error = {path = "../error"}
 ckb-tx-pool = { path = "../tx-pool" }
 crossbeam-deque = "0.7"
 crossbeam-channel = "0.3"
+tokio = "0.2"
 
 [dev-dependencies]
 ckb-test-chain-utils = { path = "../util/test-chain-utils" }

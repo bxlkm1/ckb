@@ -1016,6 +1016,7 @@ dependencies = [
  "lru-cache",
  "rand 0.6.5",
  "sentry",
+ "tokio 0.2.13",
 ]
 
 [[package]]
