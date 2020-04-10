@@ -611,7 +611,7 @@ impl Synchronizer {
             Some(raw) if ibd.into() => match self.fetch_channel {
                 Some(ref send) => send.send(FetchCMD::Fetch(peers)).unwrap(),
                 None => {
-                    tokio::spawn(async {show_metric().await});
+                    tokio::spawn(async { show_metric().await });
                     let p2p_control = raw.clone();
                     let sync = self.clone();
                     let can_fetch_block = Arc::clone(&self.can_fetch_block);

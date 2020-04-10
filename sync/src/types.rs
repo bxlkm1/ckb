@@ -1229,7 +1229,12 @@ impl SyncState {
 
     // Return true when the block is that we have requested and received first time.
     pub fn new_block_received(&self, block: &core::BlockView) -> bool {
-        self.write_inflight_blocks().remove_by_block(block.hash())
+        if self.write_inflight_blocks().remove_by_block(block.hash()) {
+            self.insert_block_status(block.hash(), BlockStatus::BLOCK_RECEIVED);
+            true
+        } else {
+            false
+        }
     }
 
     pub fn insert_inflight_proposals(&self, ids: Vec<packed::ProposalShortId>) -> Vec<bool> {
@@ -1243,7 +1248,7 @@ impl SyncState {
     }
 
     pub fn insert_orphan_block(&self, peer: PeerIndex, block: core::BlockView) {
-        self.insert_block_status(block.hash(), BlockStatus::BLOCK_RECEIVED);
+        // self.insert_block_status(block.hash(), BlockStatus::BLOCK_RECEIVED);
         self.orphan_block_pool.insert(peer, block);
     }
 
