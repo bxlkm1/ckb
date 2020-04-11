@@ -270,6 +270,7 @@ impl InflightState {
 pub struct DownloadScheduler {
     task_count: usize,
     timeout_count: usize,
+    breakthroughs_count: usize,
     hashes: HashSet<Byte32>,
 }
 
@@ -279,6 +280,7 @@ impl Default for DownloadScheduler {
             hashes: HashSet::default(),
             task_count: MAX_BLOCKS_IN_TRANSIT_PER_PEER,
             timeout_count: 0,
+            breakthroughs_count: 0,
         }
     }
 }
@@ -310,11 +312,15 @@ impl DownloadScheduler {
             0..=500 => {
                 if self.task_count < 31 {
                     self.task_count += 2
+                } else {
+                    self.breakthroughs_count += 1
                 }
             }
             501..=1000 => {
                 if self.task_count < 32 {
                     self.task_count += 1
+                } else {
+                    self.breakthroughs_count += 1
                 }
             }
             1001..=1500 => (),
@@ -325,6 +331,12 @@ impl DownloadScheduler {
                     self.timeout_count = 0;
                 }
             }
+        }
+        if self.breakthroughs_count > 4 {
+            if self.task_count < 128 {
+                self.task_count += 1;
+            }
+            self.breakthroughs_count = 0;
         }
     }
 
@@ -339,6 +351,7 @@ pub struct InflightBlocks {
     inflight_states: HashMap<Byte32, InflightState>,
     pub(crate) trace_number: BTreeMap<BlockNumber, (HashSet<Byte32>, Option<u64>)>,
     compact_reconstruct_inflight: HashMap<Byte32, HashSet<PeerIndex>>,
+    restart_number: BlockNumber,
 }
 
 impl Default for InflightBlocks {
@@ -348,6 +361,7 @@ impl Default for InflightBlocks {
             inflight_states: HashMap::default(),
             trace_number: BTreeMap::default(),
             compact_reconstruct_inflight: HashMap::default(),
+            restart_number: 0,
         }
     }
 }
@@ -473,10 +487,11 @@ impl InflightBlocks {
                 // If the time exceeds 1s, delete the task and halve the number of
                 // executable tasks for the corresponding node
                 if let Some(time) = timestamp {
-                    if now - *time > 1000 {
+                    if now > 1000 + *time {
                         for hash in hashes {
                             let state = states.remove(&hash).unwrap();
                             if let Some(d) = blocks.get_mut(&state.peer) {
+                                crate::synchronizer::PUNISH_COUNT.fetch_add(1, Ordering::Release);
                                 d.punish();
                                 d.hashes.remove(&hash);
                             };
@@ -490,6 +505,7 @@ impl InflightBlocks {
 
         if should_remove {
             self.trace_number.remove(&(tip + 1));
+            self.restart_number = tip + 1;
         }
 
         if prev_count == 0 {
@@ -525,6 +541,10 @@ impl InflightBlocks {
             .entry(number)
             .or_insert_with(|| (HashSet::default(), None));
         trace_number.0.insert(hash);
+        if self.restart_number == number {
+            trace_number.1 = Some(unix_time_as_millis() + 500);
+            self.restart_number = 0;
+        }
         ret
     }
 
@@ -913,6 +933,7 @@ impl SyncShared {
                 block.header().number(),
                 block.header().hash()
             );
+            crate::synchronizer::ORPHAN_COUNT.fetch_add(1, Ordering::Release);
             self.state.insert_orphan_block(pi, (*block).clone());
             let tip = self.shared.snapshot().tip_number();
             if let Some(entry) = self

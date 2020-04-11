@@ -146,13 +146,13 @@ impl<'a> BlockFetcher<'a> {
                 let hash = header.hash();
                 // NOTE: Filtering `BLOCK_STORED` but not `BLOCK_RECEIVED`, is for avoiding
                 // stopping synchronization even when orphan_pool maintains dirty items by bugs.
-                let stored = self
-                    .active_chain
-                    .contains_block_status(&hash, BlockStatus::BLOCK_STORED);
-                if stored {
+                let status = self.active_chain.get_block_status(&hash);
+                if status == BlockStatus::BLOCK_STORED {
                     // If the block is stored, its ancestor must on store
                     // So we can skip the search of this space directly
                     break;
+                } else if status.contains(BlockStatus::BLOCK_RECEIVED) {
+                    ()
                 } else if inflight.insert(self.peer, hash, header.number()) {
                     fetch.push(header)
                 }

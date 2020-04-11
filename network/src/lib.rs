@@ -30,6 +30,7 @@ pub use p2p::{
     traits::ServiceProtocol,
     ProtocolId,
 };
+pub use tokio;
 
 // Max message frame length for sync protocol: 2MB
 //   NOTE: update this value when block size limit changed

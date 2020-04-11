@@ -27,7 +27,7 @@ use ckb_types::{core, packed, prelude::*};
 use failure::Error as FailureError;
 use faketime::unix_time_as_millis;
 use std::cmp::min;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -40,6 +40,20 @@ pub const NO_PEER_CHECK_TOKEN: u64 = 255;
 const SYNC_NOTIFY_INTERVAL: Duration = Duration::from_millis(200);
 const IBD_BLOCK_FETCH_INTERVAL: Duration = Duration::from_millis(40);
 const NOT_IBD_BLOCK_FETCH_INTERVAL: Duration = Duration::from_millis(200);
+
+pub static ORPHAN_COUNT: AtomicUsize = AtomicUsize::new(0);
+pub static PUNISH_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+async fn show_metric() {
+    loop {
+        ckb_network::tokio::time::delay_for(Duration::from_millis(1000 * 20)).await;
+        info!(
+            "orphan count: {}, punish count: {}",
+            ORPHAN_COUNT.load(Ordering::Acquire),
+            PUNISH_COUNT.load(Ordering::Acquire)
+        )
+    }
+}
 
 enum FetchCMD {
     Fetch(Vec<PeerIndex>),
@@ -486,6 +500,7 @@ impl Synchronizer {
                     .map(|d| d.task_count())
                     .unwrap_or(crate::MAX_BLOCKS_IN_TRANSIT_PER_PEER)
             });
+            peers.reverse();
             peers
         };
 
@@ -560,6 +575,7 @@ impl CKBProtocolHandler for Synchronizer {
             .expect("set_notify at init is ok");
         nc.set_notify(Duration::from_secs(2), NO_PEER_CHECK_TOKEN)
             .expect("set_notify at init is ok");
+        nc.future_task(Box::pin(show_metric()), false).unwrap();
     }
 
     fn received(
